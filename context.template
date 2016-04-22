@@ -1,0 +1,153 @@
+;;; access local context variables
+
+(defun #PREFIX#-context-set (parameter value &optional frame)
+  (set-frame-parameter frame (intern (format "#PREFIX#-context-%s" parameter)) value)
+  value)
+
+(defun #PREFIX#-context-get (parameter &optional frame)
+  (frame-parameter frame (intern (format "#PREFIX#-context-%s" parameter))))
+
+;;; state of local context
+
+(defun #PREFIX#-context-state-var (param-name local-variable-name &optional init-value init-form)
+  (list param-name local-variable-name init-value init-form))
+
+(defun #PREFIX#-context-state-var-param-name (state-var)
+  (car state-var))
+
+(defun #PREFIX#-context-state-var-local-name (state-var)
+  (nth 1 state-var))
+
+(defun #PREFIX#-context-state-var-init-val (state-var)
+  (if (nth 3 state-var)
+      (eval (nth 3 state-var))
+    (nth 2 state-var)))
+
+(defvar #PREFIX#-context-state-variables
+  (mapcar (lambda (item)
+            (apply #'#PREFIX#-context-state-var item))
+          '(;; example variable
+            (var-name name-as-frame-parameter optional-init-value optional-init-form)))
+  "List of variables that consist the state of the local context.
+It is an list with elements of the form (param-name
+local-variable-name initial-value). For each variable in the
+alist, there is a frame parameter named
+\"context-<param-name>\", and buffer-local variable in the
+local context buffer named \"<local-variable-name>.\". The
+initial value is optional, and defaults to nil.
+
+When changing perspectives or workspaces, the old frame
+parameters are stored buffer-locally in the old context buffer,
+and the new frame parameters are loaded from the buffer-locally
+stored values in the new context buffer.")
+
+(defun #PREFIX#-context-store-state (&optional frame)
+  (when (buffer-live-p (#PREFIX#-context-get-buffer))
+    (with-current-buffer (#PREFIX#-context-get-buffer)
+      (dolist (var #PREFIX#-context-state-variables)
+        (set (#PREFIX#-context-state-var-local-name var)
+             (#PREFIX#-context-get (#PREFIX#-context-state-var-param-name var) frame))))))
+
+(defun #PREFIX#-context-attach-to-frame (ctx-buff &optional frame)
+  "Attach context buffer CTX-BUFF to FRAME.
+FRAME defaults to the selected frame.
+Return CTX-BUFF."
+  (#PREFIX#-context-set 'buffer ctx-buff frame)
+  (with-current-buffer (#PREFIX#-context-get-buffer)
+    (dolist (var #PREFIX#-context-state-variables)
+      (#PREFIX#-context-set (#PREFIX#-context-state-var-param-name var)
+                  (symbol-value (#PREFIX#-context-state-var-local-name var))
+                  frame)))
+  ctx-buff)
+
+(defun #PREFIX#-context-detach-from-frame (&optional frame)
+  (#PREFIX#-context-set 'buffer nil frame))
+
+;;; get/create context buffer
+
+(defconst #PREFIX#-context-base-name "#CONTEXT-BUFFER-NAME#")
+
+(defun #PREFIX#-context-get-buffer (&optional frame deadp)
+  "Get FRAME's context buffer.
+Return nil if FRAME has no context buffer.
+FRAME defaults to the selected frame.
+If the context buffer is killed, return nil. If DEADP is non-nil, return
+the context buffer even if it was killed."
+  (and (or deadp
+           (buffer-live-p (#PREFIX#-context-get 'buffer frame)))
+       (#PREFIX#-context-get 'buffer frame)))
+
+(defun #PREFIX#-context-create-buffer (&optional frame)
+  (#PREFIX#-context-attach-to-frame
+   (with-current-buffer
+       (get-buffer-create (generate-new-buffer #PREFIX#-context-base-name))
+     ;; put any buffer initialization code here, before creating the
+     ;; buffer-local variables.
+     ;; if you want to put code after the local variables are created, make sure
+     ;; that code doesn't erase existing buffer-local variables.
+     (dolist (var #PREFIX#-context-state-variables)
+       (make-local-variable (#PREFIX#-context-state-var-local-name var))
+       (set (#PREFIX#-context-state-var-local-name var) (#PREFIX#-context-state-var-init-val var)))
+     (current-buffer))
+   frame))
+
+(defun #PREFIX#-context-get-buffer-create (&optional frame)
+  "Get FRAME's context buffer, create one if necessary.
+FRAME defaults to the selected frame."
+  (or (#PREFIX#-context-get-buffer frame)
+      (#PREFIX#-context-create-buffer frame)))
+
+;;; workspace-local context buffer
+
+(defvar #PREFIX#-context-want-eyebrwose-local nil
+  "If non-nil, enable Eyebrowse integration.
+This means that each Eyebrowse workspace has its own context.
+This variable must be set before loading context library.")
+
+(when #PREFIX#-context-want-eyebrwose-local
+  (with-eval-after-load 'eyebrowse
+    (defun #PREFIX#-context-save-to-workspace ()
+      "Save #PREFIX#-context-buffer's state to current workspace."
+      (unless (frame-parameter nil 'eyebrowse-#PREFIX#-context-buffers)
+        (set-frame-parameter nil 'eyebrowse-#PREFIX#-context-buffers (make-hash-table)))
+      (let ((current-workspace (eyebrowse--get 'current-slot))
+            (ctx-buff (#PREFIX#-context-get-buffer)))
+        (#PREFIX#-context-store-state)
+        (puthash current-workspace ctx-buff (frame-parameter nil 'eyebrowse-#PREFIX#-context-buffers))))
+
+    (defun #PREFIX#-context-load-from-workspace ()
+      "Load #PREFIX#-context-buffer's state from current workspace."
+      (let* ((eyebrowse-#PREFIX#-context-buffers (frame-parameter nil 'eyebrowse-#PREFIX#-context-buffers))
+             (current-workspace (eyebrowse--get 'current-slot))
+             (ctx-buff (and eyebrowse-#PREFIX#-context-buffers
+                            (gethash current-workspace eyebrowse-#PREFIX#-context-buffers))))
+        (if ctx-buff
+            (#PREFIX#-context-attach-to-frame ctx-buff)
+          (#PREFIX#-context-detach-from-frame))))
+
+    (add-hook 'eyebrowse-pre-window-switch-hook #'#PREFIX#-context-save-to-workspace)
+    (add-hook 'eyebrowse-post-window-switch-hook #'#PREFIX#-context-load-from-workspace)))
+
+;;; perspective-local context buffer
+
+(defvar #PREFIX#-context-want-persp-mode-local nil
+  "If non-nil, enable persp-mode integration.
+This means that each persp-mode perspective has its own context.
+This variable must be set before loading context library.")
+
+(when #PREFIX#-context-want-persp-mode-local
+  (with-eval-after-load 'persp-mode
+    (defun #PREFIX#-context-save-to-perspective (&rest _args)
+      "Save #PREFIX#-context-buffer's state to current perspective."
+      (#PREFIX#-context-store-state)
+      (set-persp-parameter '#PREFIX#-context-buffer (#PREFIX#-context-get-buffer)))
+
+    (defun #PREFIX#-context-load-from-perspective ()
+      "Load #PREFIX#-context-buffer's state from current perspective."
+      (let ((ctx-buff (persp-parameter '#PREFIX#-context-buffer)))
+        (if ctx-buff
+            (#PREFIX#-context-attach-to-frame ctx-buff)
+          (#PREFIX#-context-detach-from-frame))))
+
+    (add-hook 'persp-before-switch-functions #'#PREFIX#-context-save-to-perspective)
+    (add-hook 'persp-activated-hook #'#PREFIX#-context-load-from-perspective)))
